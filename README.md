@@ -15,7 +15,7 @@ Automatically manages Xray routing rules based on user note directives in the Pa
 Run this one-liner on your PasarGuard Panel server:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/pasarguard-route-manager.git
+git clone https://github.com/Lordgrim77/PG-ADDON.git
 cd pasarguard-route-manager
 chmod +x install.sh
 sudo ./install.sh
