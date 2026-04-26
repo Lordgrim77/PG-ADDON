@@ -1,0 +1,39 @@
+[Unit]
+Description=PasarGuard Route Manager — Auto-manage Xray routing rules
+Documentation=https://github.com/PasarGuard/panel
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/pasarguard-route-manager
+
+# Main process
+ExecStart=/opt/pasarguard-route-manager/venv/bin/python3 /opt/pasarguard-route-manager/route_manager.py --daemon --verbose
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/pasarguard-route-manager /var/log
+PrivateTmp=true
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pg-route-manager
+
+[Install]
+WantedBy=multi-user.target
