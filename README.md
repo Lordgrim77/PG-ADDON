@@ -16,7 +16,7 @@ Run this one-liner on your PasarGuard Panel server:
 
 ```bash
 git clone https://github.com/Lordgrim77/PG-ADDON.git
-cd pasarguard-route-manager
+cd PG-ADDON
 chmod +x install.sh
 sudo ./install.sh
 ```
