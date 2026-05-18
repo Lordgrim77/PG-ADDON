@@ -5,8 +5,6 @@ Automatically manages Xray routing rules based on user note directives in the Pa
 ## Features
 - **Auto-Routing**: Just add `node:NAME out:TAG` to a user's note.
 - **Smart Merging**: Multiple users to one outbound = one rule.
-- **Zero Conflict**: Only manages rules it creates (tagged with `__auto_route`).
-- **Safety First**: Doesn't touch your manual rules.
 - **Self-Healing**: Automatically cleans up rules for deleted users.
 - **Service Ready**: Comes with a systemd service and automated installer.
 

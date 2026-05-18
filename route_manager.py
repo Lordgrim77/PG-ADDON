@@ -14,10 +14,6 @@ How it works:
     3. Reads core configs and builds proper Xray routing rules
     4. Pushes updated configs only when changes are detected
     5. Cleans up rules for deleted users or cleared notes
-
-Auto-managed rules are tagged with "__auto_route": true so manual rules
-are NEVER touched.
-
 Security:
     - Config file permissions restricted to 600 (owner-only read/write)
     - API token is never logged
@@ -61,10 +57,6 @@ CONFIG_DIR = Path("/etc/pasarguard-route-manager")
 CONFIG_FILE = CONFIG_DIR / "config.json"
 STATE_FILE = CONFIG_DIR / "state.json"
 LOG_FILE = Path("/var/log/pasarguard-route-manager.log")
-
-# Marker key to identify auto-managed rules
-AUTO_ROUTE_MARKER = "__auto_route"
-
 # Regex to validate note directives
 # Allows spaces around colons and hyphens/underscores in names
 DIRECTIVE_PATTERN = re.compile(
@@ -196,12 +188,12 @@ class StateManager:
         self.path.write_text(json.dumps(self._hashes, indent=2), encoding="utf-8")
         os.chmod(self.path, 0o600)
 
-    def has_changed(self, core_id: int, auto_rules: list[dict]) -> bool:
-        """Check if the auto rules for this core have changed since last apply."""
+    def has_changed(self, core_id: int, rules: list[dict]) -> bool:
+        """Check if the rules for this core have changed since last apply."""
         # Create a deterministic hash of the rules
         # Sort users within each rule for consistent comparison
         normalized = []
-        for rule in auto_rules:
+        for rule in rules:
             r = dict(rule)
             if "user" in r:
                 r["user"] = sorted(r["user"])
@@ -357,33 +349,15 @@ class RoutingEngine:
     """Builds and manages Xray routing rules based on user directives."""
 
     @staticmethod
-    def separate_rules(rules: list[dict]) -> tuple[list[dict], list[dict]]:
+    def build_rules(assignments: dict[str, list[str]]) -> list[dict]:
         """
-        Separate routing rules into auto-managed and manual.
-
-        Returns: (auto_rules, manual_rules)
-        """
-        auto_rules = []
-        manual_rules = []
-
-        for rule in rules:
-            if rule.get(AUTO_ROUTE_MARKER):
-                auto_rules.append(rule)
-            else:
-                manual_rules.append(rule)
-
-        return auto_rules, manual_rules
-
-    @staticmethod
-    def build_auto_rules(assignments: dict[str, list[str]]) -> list[dict]:
-        """
-        Build auto-managed routing rules from outbound→users mapping.
+        Build routing rules from outbound→users mapping.
 
         Args:
             assignments: {"outbound_tag": ["user_email_1", "user_email_2"]}
 
         Returns:
-            List of Xray routing rule dicts with __auto_route marker.
+            List of Xray routing rule dicts.
         """
         rules = []
         for outbound_tag, users in sorted(assignments.items()):
@@ -393,19 +367,9 @@ class RoutingEngine:
                 "type": "field",
                 "user": sorted(set(users)),  # Deduplicate and sort
                 "outboundTag": outbound_tag,
-                AUTO_ROUTE_MARKER: True,
             }
             rules.append(rule)
         return rules
-
-    @staticmethod
-    def merge_rules(manual_rules: list[dict], auto_rules: list[dict]) -> list[dict]:
-        """
-        Merge manual and auto rules back together.
-        Auto rules are appended AFTER manual rules so manual rules
-        take priority (Xray evaluates rules top-to-bottom).
-        """
-        return manual_rules + auto_rules
 
 
 # ---------------------------------------------------------------------------
@@ -509,15 +473,13 @@ class RouteSync:
                     f"outbound '{target_outbound}'"
                 )
 
-        # 4. Also handle cores that USED to have auto rules but now have none
-        #    (all directives removed)
+        # 4. Handle cores that have existing routing rules but no directives assigned
         for core in cores:
             core_id = core["id"]
             config = core.get("config", {})
             existing_rules = config.get("routing", {}).get("rules", [])
-            has_auto_rules = any(r.get(AUTO_ROUTE_MARKER) for r in existing_rules)
-            if has_auto_rules and core_id not in core_assignments:
-                core_assignments[core_id] = {}  # Empty = remove all auto rules
+            if existing_rules and core_id not in core_assignments:
+                core_assignments[core_id] = {}  # Empty = remove all rules
 
         # 5. Apply changes per core
         updates = 0
@@ -553,32 +515,25 @@ class RouteSync:
         routing = config.get("routing", {})
         existing_rules = routing.get("rules", [])
 
-        # Separate auto vs manual rules
-        old_auto_rules, manual_rules = self.engine.separate_rules(existing_rules)
-
-        # Build new auto rules
-        new_auto_rules = self.engine.build_auto_rules(assignments)
+        # Build new rules
+        new_rules = self.engine.build_rules(assignments)
 
         # Check if anything changed
-        if not self.state.has_changed(core_id, new_auto_rules):
+        if not self.state.has_changed(core_id, new_rules):
             logger.debug(f"Core '{core_name}' (id={core_id}): no changes detected")
             return False
 
-        # Merge rules
-        merged_rules = self.engine.merge_rules(manual_rules, new_auto_rules)
-
         # Log changes
-        old_user_count = sum(len(r.get("user", [])) for r in old_auto_rules)
-        new_user_count = sum(len(r.get("user", [])) for r in new_auto_rules)
+        old_user_count = sum(len(r.get("user", [])) for r in existing_rules)
+        new_user_count = sum(len(r.get("user", [])) for r in new_rules)
         logger.info(
             f"Core '{core_name}' (id={core_id}): "
-            f"auto rules {len(old_auto_rules)} → {len(new_auto_rules)}, "
-            f"users in rules {old_user_count} → {new_user_count}, "
-            f"manual rules: {len(manual_rules)} (untouched)"
+            f"rules {len(existing_rules)} → {len(new_rules)}, "
+            f"users in rules {old_user_count} → {new_user_count}"
         )
 
         # Show detailed diff
-        for rule in new_auto_rules:
+        for rule in new_rules:
             users = rule.get("user", [])
             outbound = rule.get("outboundTag", "?")
             logger.info(f"  → outbound '{outbound}': {users}")
@@ -591,7 +546,7 @@ class RouteSync:
         updated_config = copy.deepcopy(config)
         if "routing" not in updated_config:
             updated_config["routing"] = {}
-        updated_config["routing"]["rules"] = merged_rules
+        updated_config["routing"]["rules"] = new_rules
 
         # Prepare the core update payload matching CoreCreate schema
         update_payload = {
