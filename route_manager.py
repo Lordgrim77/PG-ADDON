@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import copy
+import getpass
 import hashlib
 import json
 import logging
@@ -107,7 +108,8 @@ class Config:
     def __init__(self, path: Path = CONFIG_FILE):
         self.path = path
         self.panel_url: str = ""
-        self.api_key: str = ""
+        self.username: str = ""
+        self.password: str = ""
         self.poll_interval: int = 60
         self.verify_ssl: bool = True
 
@@ -118,10 +120,11 @@ class Config:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self.panel_url = data.get("panel_url", "").rstrip("/")
-            self.api_key = data.get("api_key", "")
+            self.username = data.get("username", "")
+            self.password = data.get("password", "")
             self.poll_interval = data.get("poll_interval", 60)
             self.verify_ssl = data.get("verify_ssl", True)
-            return bool(self.panel_url and self.api_key)
+            return bool(self.panel_url and self.username and self.password)
         except (json.JSONDecodeError, KeyError) as e:
             logger.error(f"Failed to parse config: {e}")
             return False
@@ -131,7 +134,8 @@ class Config:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "panel_url": self.panel_url,
-            "api_key": self.api_key,
+            "username": self.username,
+            "password": self.password,
             "poll_interval": self.poll_interval,
             "verify_ssl": self.verify_ssl,
         }
@@ -149,7 +153,8 @@ class Config:
         cfg = Config()
         print("\n=== PasarGuard Route Manager Setup ===\n")
         cfg.panel_url = input("Panel URL (e.g. https://panel.example.com): ").strip().rstrip("/")
-        cfg.api_key = input("API Key: ").strip()
+        cfg.username = input("Admin Username: ").strip()
+        cfg.password = getpass.getpass("Admin Password: ").strip()
 
         interval_str = input("Poll interval in seconds [60]: ").strip()
         cfg.poll_interval = int(interval_str) if interval_str else 60
@@ -216,8 +221,10 @@ class PanelClient:
 
     def __init__(self, config: Config):
         self.base_url = config.panel_url
-        self.api_key = config.api_key
+        self.username = config.username
+        self.password = config.password
         self.verify_ssl = config.verify_ssl
+        self._token = None
         self._client = httpx.Client(
             base_url=self.base_url,
             verify=self.verify_ssl,
@@ -225,13 +232,38 @@ class PanelClient:
             follow_redirects=True,
         )
 
+    def _authenticate(self):
+        """Obtain OAuth2 Bearer token."""
+        logger.debug("Authenticating with panel...")
+        resp = self._client.post(
+            "/api/admin/token",
+            data={
+                "username": self.username,
+                "password": self.password,
+                "grant_type": "password",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        resp.raise_for_status()
+        token_data = resp.json()
+        self._token = token_data.get("access_token")
+        if not self._token:
+            raise RuntimeError("Authentication failed: no access_token in response")
+        logger.debug("Authentication successful")
+
     def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.api_key}"}
+        if not self._token:
+            self._authenticate()
+        return {"Authorization": f"Bearer {self._token}"}
 
     def _request(self, method: str, path: str, **kwargs) -> dict | list:
-        """Make an authenticated request."""
+        """Make an authenticated request with auto-retry on 401."""
         try:
             resp = self._client.request(method, path, headers=self._headers(), **kwargs)
+            if resp.status_code == 401:
+                # Token expired, re-authenticate
+                self._token = None
+                resp = self._client.request(method, path, headers=self._headers(), **kwargs)
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
