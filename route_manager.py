@@ -107,8 +107,7 @@ class Config:
     def __init__(self, path: Path = CONFIG_FILE):
         self.path = path
         self.panel_url: str = ""
-        self.username: str = ""
-        self.password: str = ""
+        self.api_key: str = ""
         self.poll_interval: int = 60
         self.verify_ssl: bool = True
 
@@ -119,11 +118,10 @@ class Config:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self.panel_url = data.get("panel_url", "").rstrip("/")
-            self.username = data.get("username", "")
-            self.password = data.get("password", "")
+            self.api_key = data.get("api_key", "")
             self.poll_interval = data.get("poll_interval", 60)
             self.verify_ssl = data.get("verify_ssl", True)
-            return bool(self.panel_url and self.username and self.password)
+            return bool(self.panel_url and self.api_key)
         except (json.JSONDecodeError, KeyError) as e:
             logger.error(f"Failed to parse config: {e}")
             return False
@@ -133,8 +131,7 @@ class Config:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "panel_url": self.panel_url,
-            "username": self.username,
-            "password": self.password,
+            "api_key": self.api_key,
             "poll_interval": self.poll_interval,
             "verify_ssl": self.verify_ssl,
         }
@@ -152,8 +149,7 @@ class Config:
         cfg = Config()
         print("\n=== PasarGuard Route Manager Setup ===\n")
         cfg.panel_url = input("Panel URL (e.g. https://panel.example.com): ").strip().rstrip("/")
-        cfg.username = input("Admin username: ").strip()
-        cfg.password = input("Admin password: ").strip()
+        cfg.api_key = input("API Key: ").strip()
 
         interval_str = input("Poll interval in seconds [60]: ").strip()
         cfg.poll_interval = int(interval_str) if interval_str else 60
@@ -220,10 +216,8 @@ class PanelClient:
 
     def __init__(self, config: Config):
         self.base_url = config.panel_url
-        self.username = config.username
-        self.password = config.password
+        self.api_key = config.api_key
         self.verify_ssl = config.verify_ssl
-        self._token: Optional[str] = None
         self._client = httpx.Client(
             base_url=self.base_url,
             verify=self.verify_ssl,
@@ -231,38 +225,13 @@ class PanelClient:
             follow_redirects=True,
         )
 
-    def _authenticate(self):
-        """Obtain OAuth2 Bearer token."""
-        logger.debug("Authenticating with panel...")
-        resp = self._client.post(
-            "/api/admin/token",
-            data={
-                "username": self.username,
-                "password": self.password,
-                "grant_type": "password",
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        resp.raise_for_status()
-        token_data = resp.json()
-        self._token = token_data.get("access_token")
-        if not self._token:
-            raise RuntimeError("Authentication failed: no access_token in response")
-        logger.debug("Authentication successful")
-
     def _headers(self) -> dict:
-        if not self._token:
-            self._authenticate()
-        return {"Authorization": f"Bearer {self._token}"}
+        return {"Authorization": f"Bearer {self.api_key}"}
 
     def _request(self, method: str, path: str, **kwargs) -> dict | list:
-        """Make an authenticated request with auto-retry on 401."""
+        """Make an authenticated request."""
         try:
             resp = self._client.request(method, path, headers=self._headers(), **kwargs)
-            if resp.status_code == 401:
-                # Token expired, re-authenticate
-                self._token = None
-                resp = self._client.request(method, path, headers=self._headers(), **kwargs)
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
@@ -421,6 +390,15 @@ class RouteSync:
         # core_id → core dict
         core_by_id: dict[int, dict] = {c["id"]: c for c in cores}
 
+        # Build valid outbounds per core_id
+        valid_outbounds_by_core: dict[int, set[str]] = {}
+        for core in cores:
+            outbounds = set()
+            for ob in core.get("config", {}).get("outbounds", []):
+                if isinstance(ob, dict) and "tag" in ob:
+                    outbounds.add(ob["tag"])
+            valid_outbounds_by_core[core["id"]] = outbounds
+
         # 3. Parse all user directives and build per-core assignments
         #    core_id → {outbound_tag → [user_emails]}
         core_assignments: dict[int, dict[str, list[str]]] = {}
@@ -457,6 +435,13 @@ class RouteSync:
                 if not core_id:
                     logger.warning(
                         f"User '{username}': node '{node.get('name')}' has no core config, skipping"
+                    )
+                    continue
+
+                # Validate outboundTag exists in core config
+                if target_outbound not in valid_outbounds_by_core.get(core_id, set()):
+                    logger.warning(
+                        f"User '{username}': outbound '{target_outbound}' not found in core config for node '{directive['node']}'. Skipping."
                     )
                     continue
 
@@ -515,24 +500,31 @@ class RouteSync:
         routing = config.get("routing", {})
         existing_rules = routing.get("rules", [])
 
+        # Preserve manual system rules (rules that don't match by 'user')
+        manual_rules = [r for r in existing_rules if "user" not in r]
+
         # Build new rules
         new_rules = self.engine.build_rules(assignments)
 
+        # Merge them (manual system rules first, then auto-generated user rules)
+        merged_rules = manual_rules + new_rules
+
         # Check if anything changed
-        if not self.state.has_changed(core_id, new_rules):
+        if not self.state.has_changed(core_id, merged_rules):
             logger.debug(f"Core '{core_name}' (id={core_id}): no changes detected")
             return False
 
         # Log changes
-        old_user_count = sum(len(r.get("user", [])) for r in existing_rules)
+        old_user_count = sum(len(r.get("user", [])) for r in existing_rules if "user" in r)
         new_user_count = sum(len(r.get("user", [])) for r in new_rules)
         logger.info(
             f"Core '{core_name}' (id={core_id}): "
-            f"rules {len(existing_rules)} → {len(new_rules)}, "
-            f"users in rules {old_user_count} → {new_user_count}"
+            f"rules {len(existing_rules)} → {len(merged_rules)}, "
+            f"users in rules {old_user_count} → {new_user_count} "
+            f"(preserved {len(manual_rules)} manual rules)"
         )
 
-        # Show detailed diff
+        # Show detailed diff for user rules
         for rule in new_rules:
             users = rule.get("user", [])
             outbound = rule.get("outboundTag", "?")
@@ -546,7 +538,7 @@ class RouteSync:
         updated_config = copy.deepcopy(config)
         if "routing" not in updated_config:
             updated_config["routing"] = {}
-        updated_config["routing"]["rules"] = new_rules
+        updated_config["routing"]["rules"] = merged_rules
 
         # Prepare the core update payload matching CoreCreate schema
         update_payload = {
