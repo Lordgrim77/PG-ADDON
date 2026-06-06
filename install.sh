@@ -29,7 +29,19 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# 2. Install system dependencies
+# 2. Clean up old installation
+echo -e "${YELLOW}Cleaning up old installation (preserving config)...${NC}"
+if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    systemctl stop "$SERVICE_NAME"
+fi
+if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+    systemctl disable "$SERVICE_NAME"
+fi
+if [ -d "$INSTALL_DIR" ]; then
+    rm -rf "$INSTALL_DIR"
+fi
+
+# 3. Install system dependencies
 echo -e "${YELLOW}Installing system dependencies...${NC}"
 apt-get update
 apt-get install -y python3-full python3-venv
