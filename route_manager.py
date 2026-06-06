@@ -447,8 +447,8 @@ class RouteSync:
             if not directives:
                 continue  # Manually managed, skip
 
-            # The Xray email format is: "{id}.{username}"
-            xray_email = f"{user_id}.{username}"
+            # The Xray email format in PasarGuard is just the user ID string
+            xray_email = f"{user_id}"
 
             for directive in directives:
                 target_node_name = directive["node"].lower()
