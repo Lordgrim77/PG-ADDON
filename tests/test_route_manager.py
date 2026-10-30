@@ -314,6 +314,44 @@ class TestWarpHealthManager(unittest.TestCase):
         bal_w1 = next(b for b in bals if b["tag"] == "pg-ha-warp1")
         self.assertFalse(bal_w1["fallbackTag"].startswith("pg-ha-"))
 
+    def test_refresh_avoids_unreachable_cloudflare_block(self):
+        """Reproduces Singapore-1: 16 slots, every 162.159.193.x endpoint dead from the node."""
+        core_cfg = make_sample_core_config(optimized=True)
+        core_cfg["outbounds"] = [{"tag": "direct", "protocol": "freedom", "settings": {}}] + [
+            make_wg_outbound(f"warp{i + 1}", rm.WARP_WG_ENDPOINTS[i]) for i in range(16)
+        ]
+        self.state.endpoint_cursor = 16
+
+        telemetry = {}
+        dead_tags = set()
+        for i in range(16):
+            tag = f"warp{i + 1}"
+            dead = rm.WARP_WG_ENDPOINTS[i].startswith("162.159.193.")
+            if dead:
+                dead_tags.add(tag)
+            telemetry[tag] = [{"node": "sg", "node_id": 1, "alive": not dead, "delay": 0 if dead else 21, "probed": True}]
+        self.assertEqual(dead_tags, {"warp3", "warp9", "warp15"})
+
+        self.assertEqual(
+            self.mgr.find_unreachable_prefixes(core_cfg["outbounds"], telemetry),
+            {"162.159.193.0/24"},
+        )
+
+        out, act, chg = self.mgr.heal_or_refresh_core(
+            2, "Singapore-1", core_cfg, telemetry, manual_refresh_targets={"warp3", "warp9", "warp15"}
+        )
+        self.assertTrue(chg)
+        old_eps = set(rm.WARP_WG_ENDPOINTS[:16])
+        new_eps = []
+        for base in ("warp3", "warp9", "warp15"):
+            self.assertEqual(act[base], f"{base}__r0001")
+            ob = next(o for o in out if o["tag"] == f"{base}__r0001")
+            ep = ob["settings"]["peers"][0]["endpoint"]
+            self.assertFalse(ep.startswith("162.159.193."), f"{base} got unreachable endpoint {ep}")
+            self.assertNotIn(ep, old_eps)
+            new_eps.append(ep)
+        self.assertEqual(len(set(new_eps)), 3, "Each refreshed slot must get a distinct endpoint")
+
     def test_masque_live_spawn_preserves_ip_and_rotates_port(self):
         core_cfg = make_sample_core_config(optimized=True)
         core_cfg["outbounds"] = [

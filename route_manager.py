@@ -127,6 +127,23 @@ WARP_WG_ENDPOINTS: tuple[str, ...] = (
     "188.114.98.11:1701",
     "162.159.193.12:500",
     "188.114.99.14:2408",
+    # Extended pool (used once the first 16 are taken or when a /24 is unreachable)
+    "162.159.192.20:500",
+    "188.114.96.20:4500",
+    "162.159.195.20:1701",
+    "188.114.97.20:2408",
+    "162.159.192.33:4500",
+    "188.114.98.33:2408",
+    "162.159.195.33:500",
+    "188.114.99.33:1701",
+    "162.159.192.48:2408",
+    "188.114.96.48:500",
+    "162.159.195.48:4500",
+    "188.114.97.48:1701",
+    "162.159.192.66:1701",
+    "188.114.98.66:4500",
+    "162.159.195.66:2408",
+    "188.114.99.66:500",
 )
 
 # Official Cloudflare MASQUE edge ports that return the pinned MASQUE cert
@@ -182,6 +199,18 @@ def _safe_chmod_600(path: Path):
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def endpoint_prefix24(endpoint: str) -> str:
+    """Return the IPv4 /24 network of an `ip:port` endpoint (e.g. '162.159.193.0/24'), or '' if not IPv4."""
+    host = endpoint.rsplit(":", 1)[0].strip("[]") if ":" in endpoint else endpoint
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return ""
+    if addr.version != 4:
+        return ""
+    return str(ipaddress.ip_network(f"{host}/24", strict=False))
 
 
 # ---------------------------------------------------------------------------
@@ -439,16 +468,40 @@ class StateManager:
         self.endpoint_cursor = cp["endpoint_cursor"]
         self.last_compact_date = cp["last_compact_date"]
 
-    def next_wg_endpoint(self, exclude_endpoints: set[str]) -> str:
-        """Select the next Cloudflare WARP WireGuard endpoint not in exclude_endpoints."""
+    def next_wg_endpoint(
+        self,
+        exclude_endpoints: set[str],
+        avoid_prefixes: Optional[set[str]] = None,
+    ) -> str:
+        """
+        Select the next Cloudflare WARP WireGuard endpoint.
+        Preference order:
+          1. Not already used AND not in an unreachable /24 (`avoid_prefixes`)
+          2. Not in an unreachable /24 (may share an edge with a healthy slot)
+          3. Not already used
+          4. Plain round-robin
+        """
+        avoid = avoid_prefixes or set()
         total = len(WARP_WG_ENDPOINTS)
-        for offset in range(total):
-            idx = (self.endpoint_cursor + offset) % total
-            candidate = WARP_WG_ENDPOINTS[idx]
-            if candidate not in exclude_endpoints:
-                self.endpoint_cursor = (idx + 1) % total
-                return candidate
-        # If all 16 are already in use, advance round-robin anyway
+
+        def pick(predicate) -> Optional[str]:
+            for offset in range(total):
+                idx = (self.endpoint_cursor + offset) % total
+                candidate = WARP_WG_ENDPOINTS[idx]
+                if predicate(candidate):
+                    self.endpoint_cursor = (idx + 1) % total
+                    return candidate
+            return None
+
+        for predicate in (
+            lambda c: c not in exclude_endpoints and endpoint_prefix24(c) not in avoid,
+            lambda c: endpoint_prefix24(c) not in avoid,
+            lambda c: c not in exclude_endpoints,
+        ):
+            chosen = pick(predicate)
+            if chosen:
+                return chosen
+
         candidate = WARP_WG_ENDPOINTS[self.endpoint_cursor % total]
         self.endpoint_cursor = (self.endpoint_cursor + 1) % total
         return candidate
@@ -868,6 +921,7 @@ class WarpHealthManager:
         base_tag: str,
         gens: dict[int, dict],
         all_outbounds: list[dict],
+        avoid_prefixes: Optional[set[str]] = None,
     ) -> tuple[dict, str]:
         """
         Clone the latest outbound of `base_tag` into a new `base_tag__rNNNN` outbound
@@ -892,7 +946,7 @@ class WarpHealthManager:
                 settings["mtu"] = 1280
             peers = settings.get("peers") or []
             if peers and isinstance(peers[0], dict):
-                chosen_endpoint = self.state.next_wg_endpoint(used_endpoints)
+                chosen_endpoint = self.state.next_wg_endpoint(used_endpoints, avoid_prefixes)
                 peers[0]["endpoint"] = chosen_endpoint
                 if not peers[0].get("keepAlive"):
                     peers[0]["keepAlive"] = 20
@@ -1004,6 +1058,35 @@ class WarpHealthManager:
         degraded, _ = self.is_tag_degraded(probed)
         return not degraded
 
+    def find_unreachable_prefixes(
+        self, outbounds: list[dict], telemetry: Optional[dict[str, list[dict]]]
+    ) -> set[str]:
+        """
+        Return IPv4 /24 networks where every probed WARP outbound is degraded and
+        none is healthy (e.g. a Cloudflare edge block unreachable from the node).
+        """
+        if not telemetry:
+            return set()
+        dead: dict[str, int] = {}
+        healthy: dict[str, int] = {}
+        for ob in outbounds:
+            if not isinstance(ob, dict):
+                continue
+            tag = str(ob.get("tag", ""))
+            if not is_warp_tag(tag, self.config.warp_prefix):
+                continue
+            prefix = endpoint_prefix24(self.get_outbound_endpoint(ob))
+            if not prefix:
+                continue
+            obs = telemetry.get(tag, [])
+            if not any(o.get("probed") for o in obs):
+                continue
+            if self.is_tag_degraded(obs)[0]:
+                dead[prefix] = dead.get(prefix, 0) + 1
+            else:
+                healthy[prefix] = healthy.get(prefix, 0) + 1
+        return {p for p in dead if healthy.get(p, 0) == 0}
+
     def heal_or_refresh_core(
         self,
         core_id: int,
@@ -1026,6 +1109,12 @@ class WarpHealthManager:
 
         changed = False
         now = time.time()
+        avoid_prefixes = self.find_unreachable_prefixes(outbounds, telemetry)
+        if avoid_prefixes:
+            logger.warning(
+                f"Core '{core_name}': avoiding unreachable Cloudflare block(s) for new endpoints: "
+                f"{', '.join(sorted(avoid_prefixes))}"
+            )
 
         for base_tag, gens in slots.items():
             cur_active = active_map[base_tag]
@@ -1110,7 +1199,7 @@ class WarpHealthManager:
                 )
                 continue
 
-            new_ob, new_ep = self.spawn_rotated_outbound(base_tag, gens, outbounds)
+            new_ob, new_ep = self.spawn_rotated_outbound(base_tag, gens, outbounds, avoid_prefixes)
             new_tag = new_ob["tag"]
             outbounds.append(new_ob)
             _, new_gen_num = split_generation_tag(new_tag)
