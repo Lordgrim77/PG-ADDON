@@ -232,6 +232,32 @@ class TestWarpHealthManager(unittest.TestCase):
         self.assertFalse(degraded)
         self.assertEqual(reason, "pending initial probe")
 
+    def test_burst_observatory_entries_count_as_probed(self):
+        """Xray burstObservatory always reports last_try_time=0; entries must still be evaluated."""
+
+        class FakeClient:
+            def get_node_outbounds_latency(self, node_id, node_name=""):
+                return [
+                    {"name": "warp1", "alive": False, "delay": 0, "last_try_time": 0, "last_seen_time": 0},
+                    {"name": "warp2", "alive": True, "delay": 120, "last_try_time": 0, "last_seen_time": 0},
+                ]
+
+        nodes = [{"id": 7, "name": "sg2", "core_config_id": 58, "status": "connected"}]
+        burst_cfg = make_sample_core_config(optimized=False)
+        burst_cfg["burstObservatory"] = {"subjectSelector": ["warp"], "pingConfig": {"interval": "1m"}}
+
+        tel = self.mgr.poll_core_observatory(FakeClient(), 58, nodes, core_config=burst_cfg)
+        self.assertTrue(tel["warp1"][0]["probed"])
+        self.assertTrue(self.mgr.is_tag_degraded(tel["warp1"])[0])
+        self.assertTrue(tel["warp2"][0]["probed"])
+        self.assertFalse(self.mgr.is_tag_degraded(tel["warp2"])[0])
+
+        # Regular observatory: last_try_time=0 + dead stays "pending"; alive+delay counts as probed
+        obs_cfg = make_sample_core_config(optimized=True)
+        tel2 = self.mgr.poll_core_observatory(FakeClient(), 58, nodes, core_config=obs_cfg)
+        self.assertFalse(tel2["warp1"][0]["probed"])
+        self.assertTrue(tel2["warp2"][0]["probed"])
+
     def test_auto_heal_threshold_cooldown_and_generation_reuse(self):
         core_cfg = make_sample_core_config(optimized=True)
 

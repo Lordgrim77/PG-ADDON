@@ -926,12 +926,26 @@ class WarpHealthManager:
         return template, chosen_endpoint
 
     def poll_core_observatory(
-        self, client: PanelClient, core_id: int, nodes: list[dict]
+        self,
+        client: PanelClient,
+        core_id: int,
+        nodes: list[dict],
+        core_config: Optional[dict] = None,
     ) -> dict[str, list[dict]]:
         """
         Poll /outbounds_latency across all connected nodes assigned to `core_id`.
         Returns {outbound_tag: [{"node": name, "node_id": id, "alive": bool, "delay": int, "probed": bool}, ...]}.
+
+        Note: Xray's `burstObservatory` always reports `last_try_time == 0`
+        (app/observatory/burst/burstobserver.go) but only creates an entry after a
+        real ping result, so every entry from a burst-only core counts as probed.
         """
+        burst_only = False
+        if isinstance(core_config, dict):
+            obs = core_config.get("observatory")
+            burst = core_config.get("burstObservatory")
+            burst_only = bool(isinstance(burst, dict) and burst and not (isinstance(obs, dict) and obs))
+
         core_nodes = [
             n for n in nodes
             if (n.get("core_config_id") or 1) == core_id
@@ -951,12 +965,13 @@ class WarpHealthManager:
                 last_try = int(entry.get("last_try_time", 0) or 0)
                 alive = bool(entry.get("alive", False))
                 delay = int(entry.get("delay", 0) or 0)
+                probed = last_try > 0 or burst_only or (alive and delay > 0)
                 by_tag.setdefault(tag, []).append({
                     "node": nname,
                     "node_id": nid,
                     "alive": alive,
                     "delay": delay,
-                    "probed": last_try > 0,
+                    "probed": probed,
                 })
         return by_tag
 
@@ -1600,7 +1615,7 @@ class RouteSync:
 
             telemetry: dict[str, list[dict]] = {}
             if slots and (self.config.auto_heal_warp or manual_refresh_targets):
-                telemetry = self.warp.poll_core_observatory(self.client, cid, nodes)
+                telemetry = self.warp.poll_core_observatory(self.client, cid, nodes, core_config=ccfg)
 
             pre_core_snap = self.state.snapshot()
             new_outbounds, active_map, warp_changed = self.warp.heal_or_refresh_core(
@@ -1970,7 +1985,7 @@ class RouteSync:
 
             active_map = self.warp.resolve_active_tags(cid, ccfg)
             obs_enabled = has_observatory_configured(ccfg)
-            telemetry = self.warp.poll_core_observatory(self.client, cid, nodes)
+            telemetry = self.warp.poll_core_observatory(self.client, cid, nodes, core_config=ccfg)
             retired_total = sum(max(0, len(g) - 1) for g in slots.values())
 
             print(
