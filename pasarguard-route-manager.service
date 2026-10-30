@@ -1,5 +1,5 @@
 [Unit]
-Description=PasarGuard Route Manager — Auto-manage Xray routing rules
+Description=PasarGuard Route & WARP Health Manager — Auto-manage Xray routing and zero-downtime WARP healing
 Documentation=https://github.com/PasarGuard/panel
 After=network.target
 Wants=network-online.target
