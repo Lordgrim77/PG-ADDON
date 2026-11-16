@@ -959,6 +959,21 @@ class TestMasqueMigrationAndWireGuardAging(unittest.TestCase):
             self.assertEqual(promoted, 1)
             self.assertEqual(cf_calls, cf_before, "Must adopt healthy pre-staged MASQUE outbound with 0 Cloudflare calls")
             self.assertEqual(self.state.get_active_tag(1, "warp2"), "warp2__r0001")
+
+            # 7. Active MASQUE slot stalling must NEVER downgrade back to retired WireGuard generation!
+            self.state.last_refresh_ts["1:warp1"] = 0.0
+            latencies_doc[:] = [
+                {"name": "warp1", "alive": True, "delay": 25, "last_try_time": 1700000030},
+                {"name": "warp1__r0001", "alive": False, "delay": 0, "last_try_time": 1700000030},
+                {"name": "warp2__r0001", "alive": True, "delay": 20, "last_try_time": 1700000030},
+                {"name": "warp3", "alive": True, "delay": 28, "last_try_time": 1700000030},
+                {"name": "warp4", "alive": True, "delay": 31, "last_try_time": 1700000030},
+            ]
+            syncer.sync()
+            new_w1 = self.state.get_active_tag(1, "warp1")
+            self.assertEqual(new_w1, "warp1__r0002")
+            w1_ob = next(o for o in core_doc["config"]["outbounds"] if o["tag"] == new_w1)
+            self.assertEqual(w1_ob["protocol"], "masque")
         finally:
             cf_client.close()
             client.close()

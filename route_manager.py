@@ -2232,10 +2232,15 @@ class WarpHealthManager:
             # generation of `base_tag` is confirmed healthy across probed nodes!
             reused_tag: Optional[str] = None
             if not force_spawn and not (is_manual and force_new_identity) and not is_scheduled_age and telemetry:
+                cur_ob = next((ob for ob in gens.values() if ob["tag"] == cur_active), gens[max(gens.keys())])
+                cur_proto = str(cur_ob.get("protocol", "")).lower()
                 reuse_baseline = self.state.get_latency_baseline(core_id, base_tag)
                 for gen_num, cand_ob in sorted(gens.items(), reverse=True):
                     cand_tag = cand_ob["tag"]
                     if cand_tag == cur_active:
+                        continue
+                    # Never silently downgrade an active MASQUE slot back to an old retired WireGuard generation
+                    if cur_proto == "masque" and str(cand_ob.get("protocol", "")).lower() != "masque":
                         continue
                     if self.is_tag_confirmed_healthy(telemetry.get(cand_tag, []), baseline_ms=reuse_baseline):
                         reused_tag = cand_tag
@@ -3768,6 +3773,8 @@ class RouteSync:
                 self.state.identity_created_ts[f"{cid}:{new_tag}"] = now
                 self.state.last_rotation_mode[f"{cid}:{base_tag}"] = "masque"
                 self.state.fail_counts[f"{cid}:{new_tag}"] = 0
+                # Reset WireGuard latency history so MASQUE probes aren't compared to old WG baseline
+                self.state.latency_history.pop(f"{cid}:{base_tag}", None)
                 migrated_slots += 1
             self.state.save()
 
