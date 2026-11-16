@@ -280,7 +280,7 @@ class TestWarpHealthManager(unittest.TestCase):
         self.assertEqual(act2["warp2"], "warp2__r0001")
         spawned = next(ob for ob in out2 if ob["tag"] == "warp2__r0001")
         self.assertEqual(spawned["settings"]["mtu"], 1280)
-        self.assertEqual(spawned["settings"]["peers"][0]["keepAlive"], 20)
+        self.assertNotIn("keepAlive", spawned["settings"]["peers"][0])
         # Must pick a fresh endpoint not already used by warp1..warp4
         self.assertNotIn(
             spawned["settings"]["peers"][0]["endpoint"],
@@ -352,11 +352,18 @@ class TestWarpHealthManager(unittest.TestCase):
             new_eps.append(ep)
         self.assertEqual(len(set(new_eps)), 3, "Each refreshed slot must get a distinct endpoint")
 
-    def test_masque_live_spawn_preserves_ip_and_rotates_port(self):
+    def test_masque_live_spawn_preserves_ip_rotates_port_and_cleans_partial_xmux(self):
         core_cfg = make_sample_core_config(optimized=True)
+        masque_ob = make_masque_outbound("warp1", "162.159.198.2", 443)
+        # Simulate legacy partial xmux that breaks Xray defaultMasqueXmux()
+        masque_ob["streamSettings"] = {
+            "network": "masque",
+            "security": "tls",
+            "masqueSettings": {"xmux": {"hMaxReusableSecs": "900-1800"}},
+        }
         core_cfg["outbounds"] = [
             {"tag": "direct", "protocol": "freedom", "settings": {}},
-            make_masque_outbound("warp1", "162.159.198.2", 443),
+            masque_ob,
         ]
         out, act, chg = self.mgr.heal_or_refresh_core(
             1, "masque-core", core_cfg, telemetry={}, manual_refresh_targets={"warp1"}
@@ -366,10 +373,7 @@ class TestWarpHealthManager(unittest.TestCase):
         spawned = next(ob for ob in out if ob["tag"] == "warp1__r0001")
         self.assertEqual(spawned["settings"]["address"], "162.159.198.2")
         self.assertNotEqual(spawned["settings"]["port"], 443)
-        self.assertEqual(
-            spawned["streamSettings"]["masqueSettings"]["xmux"]["hMaxReusableSecs"],
-            "900-1800",
-        )
+        self.assertNotIn("xmux", spawned["streamSettings"]["masqueSettings"])
 
     def test_optimize_and_compact_core_config(self):
         raw_cfg = make_sample_core_config(optimized=False)
@@ -413,6 +417,20 @@ class TestWarpHealthManager(unittest.TestCase):
         self.assertEqual(tags_after, ["direct", "block", "warp1", "warp2", "warp3", "warp4"])
         w2_after = next(ob for ob in compacted["outbounds"] if ob["tag"] == "warp2")
         self.assertEqual(w2_after["settings"]["peers"][0]["endpoint"], r2_ep)
+        self.assertEqual(w2_after["settings"]["peers"][0]["keepAlive"], 20)
+
+        # Verify optimize_core_config strips partial MASQUE xmux bug
+        masque_bad = make_masque_outbound("warp9", "162.159.198.2", 443)
+        masque_bad["streamSettings"] = {
+            "network": "masque",
+            "security": "tls",
+            "masqueSettings": {"xmux": {"hMaxReusableSecs": "900-1800"}},
+        }
+        compacted["outbounds"].append(masque_bad)
+        fixed_cfg, fixed_notes = self.mgr.optimize_core_config(1, compacted)
+        self.assertTrue(any("partial MASQUE xmux" in n for n in fixed_notes))
+        w9_after = next(ob for ob in fixed_cfg["outbounds"] if ob["tag"] == "warp9")
+        self.assertNotIn("xmux", w9_after["streamSettings"]["masqueSettings"])
 
 
 class TestEndToEndRouteSync(unittest.TestCase):
@@ -548,6 +566,382 @@ class TestEndToEndRouteSync(unittest.TestCase):
         bal_w2 = next(b for b in pushed_cfg["routing"]["balancers"] if b["tag"] == "pg-ha-warp2")
         self.assertEqual(bal_w2["selector"], ["warp2__r0001"])
         self.assertEqual(bal_w2["fallbackTag"], "warp3")
+
+
+class TestCryptoAndWarpRegistrar(unittest.TestCase):
+    def test_x25519_rfc7748_and_pure_python_keygen(self):
+        # RFC 7748 Section 5.2 test vector (scalar * basepoint u=9)
+        scalar = bytes.fromhex(
+            "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"
+        )
+        expected = bytes.fromhex(
+            "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"
+        )
+        # RFC vector uses an explicit arbitrary u-coordinate in sec 5.2; verify 6.1 basepoint too
+        alice_priv = bytes.fromhex(
+            "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"
+        )
+        alice_pub_expected = bytes.fromhex(
+            "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+        )
+        self.assertEqual(rm._x25519_scalar_mult(alice_priv), alice_pub_expected)
+        self.assertEqual(len(scalar), 32)
+        self.assertEqual(len(expected), 32)
+
+        priv_b64, pub_b64 = rm.generate_wireguard_keypair(prefer_cryptography=False)
+        import base64 as _b64
+        self.assertEqual(len(_b64.b64decode(priv_b64)), 32)
+        self.assertEqual(len(_b64.b64decode(pub_b64)), 32)
+        self.assertNotEqual(priv_b64, pub_b64)
+
+    def test_ec_p256_der_and_pem_generation(self):
+        import base64 as _b64
+        pkcs8_pem, spki_b64 = rm.generate_ec_p256_keypair(prefer_cryptography=False)
+        self.assertTrue(pkcs8_pem.startswith("-----BEGIN PRIVATE KEY-----\n"))
+        self.assertTrue(pkcs8_pem.rstrip().endswith("-----END PRIVATE KEY-----"))
+
+        spki_der = _b64.b64decode(spki_b64)
+        self.assertEqual(len(spki_der), 91)
+        self.assertTrue(spki_der.startswith(rm._P256_SPKI_PREFIX))
+        self.assertEqual(spki_der[len(rm._P256_SPKI_PREFIX)], 0x04)
+
+        b64_lines = "".join(
+            line for line in pkcs8_pem.splitlines()
+            if not line.startswith("-----")
+        )
+        pkcs8_der = _b64.b64decode(b64_lines)
+        self.assertEqual(len(pkcs8_der), 138)
+
+    def test_register_masque_matches_3xui_api_and_builds_clean_outbound(self):
+        seen_calls: list[dict] = []
+
+        def cf_handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8")) if request.content else None
+            seen_calls.append({
+                "method": request.method,
+                "url": str(request.url),
+                "headers": dict(request.headers),
+                "body": body,
+            })
+            if request.method == "POST" and request.url.path == "/v0a4471/reg":
+                return httpx.Response(200, json={"id": "dev-masque-1", "token": "tok-m1"})
+            if request.method == "PUT" and request.url.path == "/v0a4471/reg/dev-masque-1/account":
+                return httpx.Response(200, json={"license": body["license"]})
+            if request.method == "GET" and request.url.path == "/v0a4471/reg/dev-masque-1":
+                return httpx.Response(200, json={"id": "dev-masque-1"})
+            if request.method == "PATCH" and request.url.path == "/v0a4471/reg/dev-masque-1":
+                if body.get("tunnel_type") == "masque":
+                    return httpx.Response(200, json={
+                        "id": "dev-masque-1",
+                        "warp_enabled": False,
+                        "config": {},
+                    })
+                if body.get("warp_enabled") is True:
+                    return httpx.Response(200, json={
+                        "id": "dev-masque-1",
+                        "warp_enabled": True,
+                        "config": {
+                            "interface": {"addresses": {"v4": "172.16.0.2", "v6": "2606:4700:110::2"}},
+                            "peers": [{
+                                "public_key": "-----BEGIN PUBLIC KEY-----\nTEST\n-----END PUBLIC KEY-----\n",
+                                "endpoint": {"v4": "162.159.198.1:0"},
+                            }],
+                        },
+                    })
+            return httpx.Response(404)
+
+        client = httpx.Client(transport=httpx.MockTransport(cf_handler))
+        try:
+            registrar = rm.WarpRegistrar(http_client=client)
+            rec = registrar.register_masque(license_key="LIC-1234")
+        finally:
+            client.close()
+
+        self.assertEqual([c["method"] for c in seen_calls], ["POST", "PUT", "GET", "PATCH", "PATCH"])
+        patch_enroll = seen_calls[3]
+        self.assertEqual(patch_enroll["headers"].get("cf-client-version"), rm.CF_WARP_MASQUE_CLIENT_VER)
+        self.assertEqual(patch_enroll["body"]["key_type"], "secp256r1")
+        self.assertEqual(patch_enroll["body"]["tunnel_type"], "masque")
+
+        ob = registrar.build_masque_outbound("warp15__r0001", rec, port=443, alpn=["h3"])
+        self.assertEqual(ob["protocol"], "masque")
+        self.assertEqual(ob["settings"], {"address": "162.159.198.1", "port": 443})
+        self.assertEqual(ob["streamSettings"]["tlsSettings"]["serverName"], rm.CF_WARP_MASQUE_SNI)
+        self.assertEqual(ob["streamSettings"]["tlsSettings"]["alpn"], ["h3"])
+        self.assertEqual(ob["streamSettings"]["masqueSettings"]["warp"]["address"], ["172.16.0.2/32", "2606:4700:110::2/128"])
+        self.assertNotIn("xmux", ob["streamSettings"]["masqueSettings"])
+
+    def test_register_wireguard_and_rate_limit(self):
+        import base64 as _b64
+        cid_b64 = _b64.b64encode(bytes([12, 34, 56])).decode("ascii")
+
+        def wg_handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v0a4005/reg":
+                return httpx.Response(200, json={
+                    "id": "dev-wg-1",
+                    "token": "tok-wg",
+                    "config": {
+                        "client_id": cid_b64,
+                        "interface": {"addresses": {"v4": "172.16.0.5", "v6": "fd01::5"}},
+                        "peers": [{
+                            "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                            "endpoint": {"v4": "162.159.192.1:0"},
+                        }],
+                    },
+                })
+            return httpx.Response(429, headers={"Retry-After": "120"})
+
+        client = httpx.Client(transport=httpx.MockTransport(wg_handler))
+        try:
+            registrar = rm.WarpRegistrar(http_client=client)
+            rec = registrar.register_wireguard()
+            self.assertEqual(rec["reserved"], [12, 34, 56])
+            ob = registrar.build_wireguard_outbound("warp1__r0001", rec, endpoint="188.114.96.1:500", keepalive=0)
+            self.assertEqual(ob["settings"]["reserved"], [12, 34, 56])
+            self.assertTrue(ob["settings"]["noKernelTun"])
+            self.assertEqual(ob["streamSettings"]["sockopt"]["domainStrategy"], "ForceIPv4v6")
+            self.assertNotIn("keepAlive", ob["settings"]["peers"][0])
+        finally:
+            client.close()
+
+        client429 = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(429, headers={"Retry-After": "95"})))
+        try:
+            with self.assertRaises(rm.WarpRateLimitError) as ctx:
+                rm.WarpRegistrar(http_client=client429).register_masque()
+            self.assertEqual(ctx.exception.retry_after_sec, 95)
+        finally:
+            client429.close()
+
+        state = rm.StateManager(path=Path(tempfile.gettempdir()) / "nonexistent-rate-state.json")
+        state.record_registration(now=1000.0)
+        state.record_registration(now=1010.0)
+        allowed, wait_sec = state.can_register(max_per_hour=2, now=1020.0)
+        self.assertFalse(allowed)
+        self.assertGreater(wait_sec, 3500)
+
+
+class TestMasqueMigrationAndWireGuardAging(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.cfg = rm.Config(path=Path(self.tmpdir.name) / "config.json")
+        self.cfg.panel_url = "https://panel.local"
+        self.cfg.username = "admin"
+        self.cfg.password = "pass"
+        self.cfg.fail_threshold = 1
+        self.cfg.refresh_cooldown = 180
+        self.cfg.identity_escalate_window = 1800
+        self.cfg.latency_degrade_factor = 3.0
+        self.state = rm.StateManager(path=Path(self.tmpdir.name) / "state.json")
+        self.device_store = rm.WarpDeviceStore(path=Path(self.tmpdir.name) / "warp_devices.json")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_latency_baseline_slow_slot_detection_and_identity_escalation(self):
+        core_cfg = make_sample_core_config(optimized=True)
+        mgr = rm.WarpHealthManager(self.cfg, self.state)
+
+        # Record 3 healthy samples (~20ms) for warp2
+        healthy = {
+            f"warp{i}": [{"node": "sg", "node_id": 1, "alive": True, "delay": 20, "probed": True}]
+            for i in range(1, 5)
+        }
+        for _ in range(3):
+            _, _, chg = mgr.heal_or_refresh_core(1, "main", core_cfg, healthy)
+            self.assertFalse(chg)
+        self.assertEqual(self.state.get_latency_baseline(1, "warp2"), 20.0)
+
+        # Latency spike to 400ms (> max(250, 20*3)) -> still alive=True, but triggers slow-slot heal!
+        slow_w2 = copy.deepcopy(healthy)
+        slow_w2["warp2"] = [{"node": "sg", "node_id": 1, "alive": True, "delay": 400, "probed": True}]
+        out1, act1, chg1 = mgr.heal_or_refresh_core(1, "main", core_cfg, slow_w2)
+        self.assertTrue(chg1)
+        self.assertEqual(act1["warp2"], "warp2__r0001")
+        self.assertEqual(self.state.last_rotation_mode["1:warp2"], "endpoint")
+
+        # Now simulate warp2__r0001 stalling 300s later (past cooldown=180s, within escalate_window=1800s)
+        core_cfg["outbounds"] = out1
+        self.state.last_refresh_ts["1:warp2"] -= 300
+
+        def cf_wg(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={
+                "id": "dev-fresh-2",
+                "token": "tok-f2",
+                "config": {
+                    "client_id": "AQID",
+                    "interface": {"addresses": {"v4": "172.16.9.9", "v6": "fd01::9"}},
+                    "peers": [{"public_key": "PEERPUB", "endpoint": {"v4": "162.159.195.6:0"}}],
+                },
+            })
+
+        cf_client = httpx.Client(transport=httpx.MockTransport(cf_wg))
+        try:
+            registrar = rm.WarpRegistrar(http_client=cf_client)
+            dead_r1 = copy.deepcopy(healthy)
+            # Old warp2 stays slow while warp2__r0001 stalls -> forces fresh identity escalation!
+            dead_r1["warp2"] = [{"node": "sg", "node_id": 1, "alive": True, "delay": 400, "probed": True}]
+            dead_r1["warp2__r0001"] = [{"node": "sg", "node_id": 1, "alive": False, "delay": 0, "probed": True}]
+            out2, act2, chg2 = mgr.heal_or_refresh_core(
+                1, "main", core_cfg, dead_r1,
+                force_spawn=False,
+                registrar=registrar,
+                device_store=self.device_store,
+            )
+        finally:
+            cf_client.close()
+
+        self.assertTrue(chg2)
+        self.assertEqual(act2["warp2"], "warp2__r0002")
+        self.assertEqual(self.state.last_rotation_mode["1:warp2"], "identity")
+        spawned2 = next(o for o in out2 if o["tag"] == "warp2__r0002")
+        self.assertNotEqual(spawned2["settings"]["secretKey"], "privkey-warp2")
+        self.assertIsNotNone(self.device_store.get(1, "warp2"))
+
+    def test_scheduled_identity_max_age_hours(self):
+        self.cfg.identity_max_age_hours = 12.0
+        core_cfg = make_sample_core_config(optimized=True)
+        mgr = rm.WarpHealthManager(self.cfg, self.state)
+
+        # Seed warp1 age at 13 hours ago, others fresh
+        import time as _time
+        now = _time.time()
+        self.state.identity_created_ts["1:warp1"] = now - (13.0 * 3600.0)
+        for slot in ("warp2", "warp3", "warp4"):
+            self.state.identity_created_ts[f"1:{slot}"] = now
+
+        cf_client = httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, json={
+            "id": "dev-age-1",
+            "token": "tok-a1",
+            "config": {
+                "client_id": "AQID",
+                "interface": {"addresses": {"v4": "172.16.8.8"}},
+                "peers": [{"public_key": "PEER", "endpoint": {"v4": "162.159.192.7:0"}}],
+            },
+        })))
+        try:
+            registrar = rm.WarpRegistrar(http_client=cf_client)
+            _, act, chg = mgr.heal_or_refresh_core(
+                1, "main", core_cfg, telemetry={}, registrar=registrar, device_store=self.device_store
+            )
+        finally:
+            cf_client.close()
+
+        self.assertTrue(chg)
+        self.assertEqual(act["warp1"], "warp1__r0001")
+        self.assertEqual(act["warp2"], "warp2")
+
+    def test_diagnose_and_migrate_masque_flows(self):
+        core_doc = {
+            "id": 1,
+            "name": "main-xray",
+            "type": "xray",
+            "config": make_sample_core_config(optimized=True),
+            "exclude_inbound_tags": [],
+            "fallbacks_inbound_tags": [],
+        }
+        # Clone warp1's secretKey onto warp2 to test duplicate identity audit
+        core_doc["config"]["outbounds"][3]["settings"]["secretKey"] = (
+            core_doc["config"]["outbounds"][2]["settings"]["secretKey"]
+        )
+        nodes_doc = [
+            {"id": 10, "name": "sg", "core_config_id": 1, "status": "connected", "xray_version": "26.9.30"},
+        ]
+        users_doc = [{"id": 101, "username": "alice", "note": "node:sg out:warp1"}]
+        latencies_doc = [
+            {"name": "warp1", "alive": True, "delay": 25, "last_try_time": 1700000000},
+            {"name": "warp2", "alive": True, "delay": 30, "last_try_time": 1700000000},
+            {"name": "warp3", "alive": True, "delay": 28, "last_try_time": 1700000000},
+            {"name": "warp4", "alive": True, "delay": 31, "last_try_time": 1700000000},
+        ]
+        puts: list[dict] = []
+
+        def panel_handler(request: httpx.Request) -> httpx.Response:
+            p = request.url.path
+            if p == "/api/admin/token":
+                return httpx.Response(200, json={"access_token": "tok"})
+            if p == "/api/users":
+                return httpx.Response(200, json={"users": users_doc, "total": len(users_doc)})
+            if p == "/api/nodes":
+                return httpx.Response(200, json={"nodes": nodes_doc})
+            if p == "/api/cores":
+                return httpx.Response(200, json={"cores": [core_doc]})
+            if p == "/api/core/1" and request.method == "GET":
+                return httpx.Response(200, json=core_doc)
+            if p == "/api/node/10/outbounds_latency":
+                return httpx.Response(200, json={"latencies": latencies_doc})
+            if p == "/api/core/1" and request.method == "PUT":
+                body = json.loads(request.content.decode("utf-8"))
+                puts.append(body)
+                core_doc["config"] = body["config"]
+                return httpx.Response(200, json=core_doc)
+            return httpx.Response(404)
+
+        client = rm.PanelClient(self.cfg)
+        client._client.close()
+        client._client = httpx.Client(base_url=self.cfg.panel_url, transport=httpx.MockTransport(panel_handler))
+
+        cf_calls = 0
+
+        def cf_masque_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal cf_calls
+            cf_calls += 1
+            if request.method == "POST":
+                return httpx.Response(200, json={"id": f"m-{cf_calls}", "token": f"t-{cf_calls}"})
+            return httpx.Response(200, json={
+                "id": f"m-{cf_calls}",
+                "warp_enabled": True,
+                "config": {
+                    "interface": {"addresses": {"v4": "172.16.0.2", "v6": "2606:4700::2"}},
+                    "peers": [{"public_key": "MASQUE_PUB", "endpoint": {"v4": "162.159.198.2:0"}}],
+                },
+            })
+
+        cf_client = httpx.Client(transport=httpx.MockTransport(cf_masque_handler))
+        try:
+            registrar = rm.WarpRegistrar(http_client=cf_client)
+            syncer = rm.RouteSync(
+                client, self.state, config=self.cfg, dry_run=False,
+                device_store=self.device_store, registrar=registrar,
+            )
+
+            # 1. --diagnose flags duplicate secretKey AND old xray_version
+            diag = syncer.diagnose()
+            rep = diag["cores"][0]
+            self.assertFalse(rep["masque_ready"])
+            self.assertIn("26.9.30", rep["masque_blockers"][0])
+            self.assertEqual(len(rep["duplicate_keys"]), 1)
+
+            # 2. --migrate-masque MUST refuse when node Xray < 26.10.21
+            self.assertEqual(syncer.migrate_to_masque("warp1"), 0)
+            self.assertEqual(cf_calls, 0)
+            self.assertEqual(len(puts), 0)
+
+            # Upgrade node Xray version >= 26.10.21
+            nodes_doc[0]["xray_version"] = "26.11.9"
+
+            # 3. Probe stays DEAD for warp2 -> Stage A adds warp2__r0001, Stage B MUST NOT switch routing!
+            latencies_doc.append({"name": "warp2__r0001", "alive": False, "delay": 0, "last_try_time": 1700000010})
+            self.assertEqual(syncer.migrate_to_masque("warp2", probe_timeout=1, wait_probe=True), 0)
+            self.assertEqual(len(puts), 1, "Only Stage A AddOutbound should have executed")
+            self.assertNotEqual(self.state.get_active_tag(1, "warp2"), "warp2__r0001")
+
+            # 4. Probe OK for warp1 -> Stage A + Stage B execute live with 0 Xray restarts!
+            puts_before = len(puts)
+            latencies_doc.append({"name": "warp1__r0001", "alive": True, "delay": 18, "last_try_time": 1700000020})
+            migrated = syncer.migrate_to_masque("warp1", probe_timeout=2, wait_probe=True)
+            self.assertEqual(migrated, 1)
+            self.assertEqual(len(puts) - puts_before, 2, "Expected Stage A (AddOutbound) + Stage B (ReplaceRouting)")
+
+            stage_b_cfg = puts[-1]["config"]
+            new_ob = next(o for o in stage_b_cfg["outbounds"] if o["tag"] == "warp1__r0001")
+            self.assertEqual(new_ob["protocol"], "masque")
+            self.assertNotIn("xmux", new_ob["streamSettings"]["masqueSettings"])
+            bal_w1 = next(b for b in stage_b_cfg["routing"]["balancers"] if b["tag"] == "pg-ha-warp1")
+            self.assertEqual(bal_w1["selector"], ["warp1__r0001"])
+            self.assertIsNotNone(self.device_store.get(1, "warp1"))
+        finally:
+            cf_client.close()
+            client.close()
 
 
 if __name__ == "__main__":

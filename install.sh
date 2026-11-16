@@ -48,12 +48,12 @@ echo -e "${YELLOW}Installing system dependencies...${NC}"
 apt-get update
 apt-get install -y python3-full python3-venv
 
-# 4. Create virtual environment and install httpx
+# 4. Create virtual environment and install httpx + cryptography
 echo -e "${YELLOW}Setting up virtual environment...${NC}"
 mkdir -p "$INSTALL_DIR"
 python3 -m venv "$INSTALL_DIR/venv"
-"$INSTALL_DIR/venv/bin/pip" install --upgrade pip httpx
-echo -e "${GREEN}✓ Virtual environment and httpx ready${NC}"
+"$INSTALL_DIR/venv/bin/pip" install --upgrade pip httpx cryptography
+echo -e "${GREEN}✓ Virtual environment, httpx, and cryptography ready${NC}"
 
 # 5. Copy script and create CLI symlink
 echo -e "${YELLOW}Installing route_manager.py...${NC}"
@@ -104,10 +104,11 @@ echo "One-time WARP HA & Observatory Setup (recommended):"
 echo "  pg-route-manager --optimize-warp --dry-run   # Preview Core Config changes"
 echo "  pg-route-manager --optimize-warp             # Enable Observatory, MTU=1280, KeepAlive=20 & HA"
 echo ""
-echo "Zero-Downtime WARP Commands:"
+echo "Zero-Downtime WARP & MASQUE Commands:"
+echo "  pg-route-manager --diagnose                  # Audit Xray versions (>=26.10.21), duplicate keys & config"
 echo "  pg-route-manager --status                    # Live WARP latency & health across all nodes"
 echo "  pg-route-manager --refresh warp2             # Refresh warp2 live (0 Xray restarts, 0 user drops)"
-echo "  pg-route-manager --refresh all               # Refresh all warp* slots live"
+echo "  pg-route-manager --migrate-masque warp15     # Live-migrate trial slot to MASQUE (Xray >= 26.10.21)"
 echo "  pg-route-manager --compact                   # Prune retired *__rNNNN outbounds (maintenance)"
 echo ""
 echo "Service Commands:"
