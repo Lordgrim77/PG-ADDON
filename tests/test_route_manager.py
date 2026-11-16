@@ -939,6 +939,26 @@ class TestMasqueMigrationAndWireGuardAging(unittest.TestCase):
             bal_w1 = next(b for b in stage_b_cfg["routing"]["balancers"] if b["tag"] == "pg-ha-warp1")
             self.assertEqual(bal_w1["selector"], ["warp1__r0001"])
             self.assertIsNotNone(self.device_store.get(1, "warp1"))
+
+            # 5. Daemon process with stale in-memory state MUST reload disk state updated by CLI
+            daemon_state = rm.StateManager(path=self.state.path)
+            daemon_state.active_generations = {"1": {"warp1": "warp1"}}
+            daemon_state._loaded_sig = None  # simulates pre-migration load in long-running daemon
+            daemon_syncer = rm.RouteSync(client, daemon_state, config=self.cfg, dry_run=False)
+            daemon_updates = daemon_syncer.sync()
+            self.assertEqual(daemon_state.get_active_tag(1, "warp1"), "warp1__r0001")
+            bal_w1_after = next(b for b in core_doc["config"]["routing"]["balancers"] if b["tag"] == "pg-ha-warp1")
+            self.assertEqual(bal_w1_after["selector"], ["warp1__r0001"])
+            self.assertEqual(daemon_updates, 0, "Daemon should see already-synced MASQUE state and make 0 PUTs")
+
+            # 6. Once previously-staged warp2__r0001 recovers OK, re-running --migrate-masque promotes it with 0 CF calls!
+            latencies_doc[-2]["alive"] = True
+            latencies_doc[-2]["delay"] = 22
+            cf_before = cf_calls
+            promoted = syncer.migrate_to_masque("warp2", probe_timeout=1, wait_probe=True)
+            self.assertEqual(promoted, 1)
+            self.assertEqual(cf_calls, cf_before, "Must adopt healthy pre-staged MASQUE outbound with 0 Cloudflare calls")
+            self.assertEqual(self.state.get_active_tag(1, "warp2"), "warp2__r0001")
         finally:
             cf_client.close()
             client.close()

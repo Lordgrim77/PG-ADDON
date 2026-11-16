@@ -46,6 +46,7 @@ Usage:
 
 import argparse
 import base64
+import contextlib
 import copy
 import datetime as dt
 import getpass
@@ -63,6 +64,11 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Dependency check
@@ -225,6 +231,64 @@ def _safe_chmod_600(path: Path):
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def _file_sig(path: Path) -> Optional[tuple[int, int]]:
+    """Return (mtime_ns, size) if `path` exists, else None."""
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _atomic_write_text(path: Path, text: str):
+    """Atomically write UTF-8 text with 0600 permissions so readers never see partial JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        _safe_chmod_600(tmp)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def _interprocess_lock(lock_path: Path):
+    """Advisory inter-process lock (POSIX flock) preventing CLI vs Daemon state races."""
+    if fcntl is None:
+        yield
+        return
+    f = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        f = lock_path.open("a+", encoding="utf-8")
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        # Fail open in restricted read-only test/non-root environments
+        if f is not None:
+            try:
+                f.close()
+            except OSError:
+                pass
+            f = None
+    try:
+        yield
+    finally:
+        if f is not None:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                f.close()
+            except OSError:
+                pass
 
 
 def endpoint_prefix24(endpoint: str) -> str:
@@ -515,6 +579,13 @@ class Config:
         self.max_registrations_per_hour: int = 6
         self.warp_license: str = ""
         self.live_remove_supported: bool = False
+        self._loaded_sig: Optional[tuple[int, int]] = None
+
+    def reload_if_newer(self) -> bool:
+        sig = _file_sig(self.path)
+        if sig is not None and sig != self._loaded_sig:
+            return self.load()
+        return False
 
     @staticmethod
     def _parse_masque_alpn(raw: Any) -> list[str]:
@@ -563,6 +634,7 @@ class Config:
             self.max_registrations_per_hour = max(1, int(data.get("max_registrations_per_hour", 6)))
             self.warp_license = str(data.get("warp_license", "")).strip()
             self.live_remove_supported = bool(data.get("live_remove_supported", False))
+            self._loaded_sig = _file_sig(self.path)
             return bool(self.panel_url and self.username and self.password)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             logger.error(f"Failed to parse config: {e}")
@@ -570,7 +642,6 @@ class Config:
 
     def save(self):
         """Save config to file with restricted permissions."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "panel_url": self.panel_url,
             "username": self.username,
@@ -595,11 +666,8 @@ class Config:
             "warp_license": self.warp_license,
             "live_remove_supported": self.live_remove_supported,
         }
-        self.path.write_text(
-            json.dumps(data, indent=2),
-            encoding="utf-8",
-        )
-        _safe_chmod_600(self.path)
+        _atomic_write_text(self.path, json.dumps(data, indent=2))
+        self._loaded_sig = _file_sig(self.path)
         logger.info(f"Config saved to {self.path} (permissions: 600)")
 
     @staticmethod
@@ -658,6 +726,14 @@ class StateManager:
         self.identity_created_ts: dict[str, float] = {}
         # unix timestamps of Cloudflare WARP registrations (rolling 1-hour window)
         self.registration_timestamps: list[float] = []
+        self._loaded_sig: Optional[tuple[int, int]] = None
+
+    def reload_if_newer(self) -> bool:
+        sig = _file_sig(self.path)
+        if sig is not None and sig != self._loaded_sig:
+            self.load()
+            return True
+        return False
 
     def load(self):
         if not self.path.exists():
@@ -702,12 +778,12 @@ class StateManager:
                 float(x) for x in raw.get("registration_timestamps", [])
                 if isinstance(x, (int, float))
             ]
+            self._loaded_sig = _file_sig(self.path)
         except (json.JSONDecodeError, ValueError, TypeError):
             self._hashes = {}
 
     def save(self):
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "hashes": self._hashes,
                 "active_generations": self.active_generations,
@@ -720,8 +796,8 @@ class StateManager:
                 "identity_created_ts": self.identity_created_ts,
                 "registration_timestamps": self.prune_registrations(),
             }
-            self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            _safe_chmod_600(self.path)
+            _atomic_write_text(self.path, json.dumps(payload, indent=2))
+            self._loaded_sig = _file_sig(self.path)
         except OSError as e:
             logger.debug(f"Skipping state save ({self.path}): {e}")
 
@@ -918,10 +994,18 @@ class WarpDeviceStore:
     def __init__(self, path: Path = WARP_DEVICES_FILE):
         self.path = path
         self.devices: dict[str, dict[str, Any]] = {}
+        self._loaded_sig: Optional[tuple[int, int]] = None
 
     @staticmethod
     def _slot_key(core_id: int, base_tag: str) -> str:
         return f"{core_id}:{base_tag}"
+
+    def reload_if_newer(self) -> bool:
+        sig = _file_sig(self.path)
+        if sig is not None and sig != self._loaded_sig:
+            self.load()
+            return True
+        return False
 
     def load(self):
         if not self.path.exists():
@@ -936,15 +1020,15 @@ class WarpDeviceStore:
                         for k, v in devs.items()
                         if isinstance(v, dict)
                     }
+                    self._loaded_sig = _file_sig(self.path)
         except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
             logger.debug(f"Could not read WARP device store ({self.path}): {e}")
 
     def save(self):
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
             payload = {"devices": self.devices}
-            self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            _safe_chmod_600(self.path)
+            _atomic_write_text(self.path, json.dumps(payload, indent=2))
+            self._loaded_sig = _file_sig(self.path)
         except OSError as e:
             logger.debug(f"Skipping WARP device store save ({self.path}): {e}")
 
@@ -2657,6 +2741,32 @@ class RouteSync:
         self.warp = WarpHealthManager(self.config, self.state)
         self.device_store = device_store if device_store is not None else WarpDeviceStore()
         self.registrar = registrar if registrar is not None else WarpRegistrar()
+        self._lock_depth = 0
+
+    @contextlib.contextmanager
+    def _exclusive_guard(self):
+        """
+        Reentrant cross-process lock + external state reload so concurrent CLI writes
+        (--migrate-masque, --refresh, --compact) and the background Daemon never
+        clobber each other's state or Panel balancers.
+        """
+        if self.dry_run or self._lock_depth > 0:
+            self._lock_depth += 1
+            try:
+                yield
+            finally:
+                self._lock_depth -= 1
+            return
+
+        with _interprocess_lock(self.state.path.with_suffix(".lock")):
+            self._lock_depth += 1
+            try:
+                self.config.reload_if_newer()
+                self.state.reload_if_newer()
+                self.device_store.reload_if_newer()
+                yield
+            finally:
+                self._lock_depth -= 1
 
     @staticmethod
     def _filter_cores(cores: list[dict], selector: Optional[str]) -> list[dict]:
@@ -2708,14 +2818,15 @@ class RouteSync:
         dry_snap = self.state.snapshot() if self.dry_run else None
         dev_snap = self.device_store.snapshot() if self.dry_run else None
         try:
-            return self._sync_impl(
-                manual_refresh_targets=manual_refresh_targets,
-                core_selector=core_selector,
-                force_spawn=force_spawn,
-                force_new_identity=force_new_identity,
-                license_key=license_key,
-                routing_only=routing_only,
-            )
+            with self._exclusive_guard():
+                return self._sync_impl(
+                    manual_refresh_targets=manual_refresh_targets,
+                    core_selector=core_selector,
+                    force_spawn=force_spawn,
+                    force_new_identity=force_new_identity,
+                    license_key=license_key,
+                    routing_only=routing_only,
+                )
         finally:
             if dry_snap is not None:
                 self.state.restore(dry_snap)
@@ -3113,30 +3224,32 @@ class RouteSync:
 
     def optimize_warp(self, core_selector: Optional[str] = None) -> int:
         """Run one-time WARP HA + Observatory + MTU/KeepAlive optimization."""
-        cores = self._filter_cores(self.client.get_cores(), core_selector)
-        count = 0
-        for core in cores:
-            if str(core.get("type", "xray")).lower() != "xray":
-                continue
-            if self._apply_maintenance_transform(core, mode="optimize"):
-                count += 1
-        # Follow up with a live routing sync so user rules bind to the new HA balancers
-        if count > 0 and not self.dry_run:
-            self.sync(core_selector=core_selector)
-        return count
+        with self._exclusive_guard():
+            cores = self._filter_cores(self.client.get_cores(), core_selector)
+            count = 0
+            for core in cores:
+                if str(core.get("type", "xray")).lower() != "xray":
+                    continue
+                if self._apply_maintenance_transform(core, mode="optimize"):
+                    count += 1
+            # Follow up with a live routing sync so user rules bind to the new HA balancers
+            if count > 0 and not self.dry_run:
+                self.sync(core_selector=core_selector)
+            return count
 
     def compact_warp(self, core_selector: Optional[str] = None) -> int:
         """Collapse retired `*__rNNNN` outbounds back to base WARP tags."""
-        cores = self._filter_cores(self.client.get_cores(), core_selector)
-        count = 0
-        for core in cores:
-            if str(core.get("type", "xray")).lower() != "xray":
-                continue
-            if self._apply_maintenance_transform(core, mode="compact"):
-                count += 1
-        if count > 0 and not self.dry_run:
-            self.sync(core_selector=core_selector)
-        return count
+        with self._exclusive_guard():
+            cores = self._filter_cores(self.client.get_cores(), core_selector)
+            count = 0
+            for core in cores:
+                if str(core.get("type", "xray")).lower() != "xray":
+                    continue
+                if self._apply_maintenance_transform(core, mode="compact"):
+                    count += 1
+            if count > 0 and not self.dry_run:
+                self.sync(core_selector=core_selector)
+            return count
 
     def print_status(self, core_selector: Optional[str] = None):
         """Print a human-readable health dashboard of all WARP slots across cores & nodes."""
@@ -3228,6 +3341,14 @@ class RouteSync:
         fp_groups: dict[str, list[str]] = {}
         ep_groups: dict[str, list[str]] = {}
         slot_reports: list[dict[str, Any]] = []
+        bal_selectors: dict[str, str] = {}
+        for bal in (ccfg.get("routing") or {}).get("balancers") or []:
+            if not isinstance(bal, dict):
+                continue
+            btag = str(bal.get("tag", ""))
+            sels = bal.get("selector") or []
+            if btag.startswith(HA_BALANCER_PREFIX) and len(sels) == 1 and isinstance(sels[0], str):
+                bal_selectors[btag[len(HA_BALANCER_PREFIX):]] = sels[0]
 
         for base_tag, gens in slots.items():
             act_tag = active_map[base_tag]
@@ -3237,6 +3358,9 @@ class RouteSync:
             settings = act_ob.get("settings") or {}
             stream = act_ob.get("streamSettings") or {}
             issues: list[str] = []
+            bal_sel = bal_selectors.get(base_tag)
+            if bal_sel and bal_sel != act_tag:
+                issues.append(f"panel balancer routes to '{bal_sel}' vs state '{act_tag}'")
 
             secret = ""
             if proto == "wireguard":
@@ -3421,6 +3545,25 @@ class RouteSync:
         migrate_all = "all" in raw_targets
         normalized_targets = {split_generation_tag(t)[0] for t in raw_targets if t != "all"}
 
+        with self._exclusive_guard():
+            return self._migrate_to_masque_impl(
+                migrate_all=migrate_all,
+                normalized_targets=normalized_targets,
+                core_selector=core_selector,
+                probe_timeout=probe_timeout,
+                wait_probe=wait_probe,
+                license_key=license_key,
+            )
+
+    def _migrate_to_masque_impl(
+        self,
+        migrate_all: bool,
+        normalized_targets: set[str],
+        core_selector: Optional[str],
+        probe_timeout: int,
+        wait_probe: bool,
+        license_key: str,
+    ) -> int:
         nodes = self.client.get_nodes()
         cores = self._filter_cores(self.client.get_cores(), core_selector)
         eff_license = (license_key or self.config.warp_license or "").strip()
@@ -3472,123 +3615,155 @@ class RouteSync:
             if not slots_to_migrate:
                 continue
 
+            # Reuse any already-staged healthy MASQUE generation (e.g. left in core config from an earlier run)
+            pre_telemetry = self.warp.poll_core_observatory(self.client, cid, nodes, core_config=ccfg)
+            pre_verified: list[tuple[str, str, str]] = []
+            need_enroll: list[str] = []
+            for base_tag in slots_to_migrate:
+                adopted = None
+                for _, cand_ob in sorted(slots[base_tag].items(), reverse=True):
+                    if str(cand_ob.get("protocol", "")).lower() == "masque":
+                        cand_tag = cand_ob["tag"]
+                        if self.warp.is_tag_confirmed_healthy(pre_telemetry.get(cand_tag, [])):
+                            adopted = (base_tag, cand_tag, self.warp.get_outbound_endpoint(cand_ob))
+                            break
+                if adopted:
+                    pre_verified.append(adopted)
+                else:
+                    need_enroll.append(base_tag)
+
             if self.dry_run:
                 node_vers = ", ".join(
                     f"{n.get('name', n.get('id'))}={n.get('xray_version')}" for n in assigned
                 )
+                adopt_msg = (
+                    f"promote {len(pre_verified)} already-healthy staged MASQUE outbound(s) {[p[1] for p in pre_verified]} and "
+                    if pre_verified else ""
+                )
+                enroll_msg = (
+                    f"enroll {len(need_enroll)} new Cloudflare MASQUE device(s) for [{', '.join(need_enroll)}]"
+                    if need_enroll else "make 0 new registrations"
+                )
                 logger.info(
                     f"Core '{cname}' (id={cid}) [DRY RUN MASQUE]: node Xray versions OK ({node_vers}); "
-                    f"would enroll {len(slots_to_migrate)} dedicated Cloudflare MASQUE device(s) for "
-                    f"[{', '.join(slots_to_migrate)}] → Stage A AddOutbound → probe check → Stage B live cutover."
+                    f"would {adopt_msg}{enroll_msg} → live Stage B cutover."
                 )
                 continue
 
-            # Gate 2: Cloudflare registration hourly budget check
-            recent = self.state.prune_registrations()
-            remaining_budget = max(0, self.config.max_registrations_per_hour - len(recent))
-            if len(slots_to_migrate) > remaining_budget:
-                logger.error(
-                    f"Core '{cname}' (id={cid}): requested {len(slots_to_migrate)} MASQUE registration(s), "
-                    f"but only {remaining_budget} slot(s) remain in current 1-hour limit "
-                    f"(max_registrations_per_hour={self.config.max_registrations_per_hour}). "
-                    f"Migrate a smaller batch (e.g. trial 1 slot first) or raise max_registrations_per_hour in config.json."
-                )
-                continue
-
-            # Stage A: Register fresh Cloudflare MASQUE identities & append outbounds ONLY (0 Xray restarts)
-            stage_a_cfg = copy.deepcopy(ccfg)
-            used_endpoints = self.warp._collect_used_endpoints(stage_a_cfg.get("outbounds", []))
-            staged: list[tuple[str, str, str]] = []
-
-            for base_tag in slots_to_migrate:
-                gens = slots[base_tag]
-                next_gen = max(gens.keys()) + 1
-                new_tag = format_generation_tag(base_tag, next_gen)
-                try:
-                    self.state.record_registration()
-                    rec = self.registrar.register_masque(license_key=eff_license)
-                except WarpRateLimitError as e:
+            # Gate 2: Cloudflare registration hourly budget check (only for slots requiring new enrollment)
+            if need_enroll:
+                recent = self.state.prune_registrations()
+                remaining_budget = max(0, self.config.max_registrations_per_hour - len(recent))
+                if len(need_enroll) > remaining_budget:
                     logger.error(
-                        f"Core '{cname}': Cloudflare rate limit hit while enrolling '{base_tag}': {e}. Stopping registration batch."
+                        f"Core '{cname}' (id={cid}): requested {len(need_enroll)} MASQUE registration(s), "
+                        f"but only {remaining_budget} slot(s) remain in current 1-hour limit "
+                        f"(max_registrations_per_hour={self.config.max_registrations_per_hour}). "
+                        f"Migrate a smaller batch (e.g. trial 1 slot first) or raise max_registrations_per_hour in config.json."
                     )
-                    break
-                except WarpRegistrationError as e:
-                    logger.error(f"Core '{cname}': MASQUE registration failed for '{base_tag}': {e}")
                     continue
 
-                self.device_store.put(cid, base_tag, rec)
-                port = self.warp._pick_masque_port(rec["endpoint_ip"], used_endpoints)
-                ep = f"{rec['endpoint_ip']}:{port}"
-                used_endpoints.add(ep)
-                new_ob = self.registrar.build_masque_outbound(
-                    new_tag, rec, port=port, alpn=self.config.masque_alpn
+            for base_tag, existing_tag, ep in pre_verified:
+                logger.info(
+                    f"Core '{cname}': Reusing already-staged healthy MASQUE outbound '{existing_tag}' ({ep}) for '{base_tag}' (0 new registrations)."
                 )
-                stage_a_cfg.setdefault("outbounds", []).append(new_ob)
-                staged.append((base_tag, new_tag, ep))
-                logger.info(f"Core '{cname}': Enrolled MASQUE device for '{base_tag}' → staged outbound '{new_tag}' ({ep})")
 
-            if not staged:
-                logger.error(f"Core '{cname}': no MASQUE outbounds were enrolled; aborting Stage A.")
-                continue
+            newly_verified: list[tuple[str, str, str]] = []
+            if need_enroll:
+                # Stage A: Register fresh Cloudflare MASQUE identities & append outbounds ONLY (0 Xray restarts)
+                stage_a_cfg = copy.deepcopy(ccfg)
+                used_endpoints = self.warp._collect_used_endpoints(stage_a_cfg.get("outbounds", []))
+                staged: list[tuple[str, str, str]] = []
 
-            is_safe, unsafe_reason = LiveSafetyValidator.check(
-                ccfg, stage_a_cfg, live_remove_supported=self.config.live_remove_supported
-            )
-            if not is_safe:
-                logger.error(f"Core '{cname}': Stage A refused (would restart Xray: {unsafe_reason})")
-                continue
-
-            payload_a = {
-                "name": core.get("name"),
-                "config": stage_a_cfg,
-                "type": core.get("type"),
-                "exclude_inbound_tags": list(core.get("exclude_inbound_tags", [])),
-                "fallbacks_inbound_tags": list(core.get("fallbacks_inbound_tags", [])),
-            }
-            self.client.update_core(cid, payload_a, restart_nodes=True)
-            self.device_store.save()
-            self.state.save()
-            logger.info(
-                f"Core '{cname}': Stage A AddOutbound pushed live for {len(staged)} MASQUE outbound(s) (0 Xray restarts; users untouched)."
-            )
-
-            # Observatory verification loop
-            verified: list[tuple[str, str, str]] = []
-            if not wait_probe:
-                verified = list(staged)
-            else:
-                deadline = time.monotonic() + max(1, int(probe_timeout))
-                pending = list(staged)
-                while pending:
-                    telemetry = self.warp.poll_core_observatory(self.client, cid, nodes, core_config=stage_a_cfg)
-                    still_pending: list[tuple[str, str, str]] = []
-                    for item in pending:
-                        if self.warp.is_tag_confirmed_healthy(telemetry.get(item[1], [])):
-                            verified.append(item)
-                            logger.info(f"Core '{cname}': Probe verified MASQUE outbound '{item[1]}' ({item[2]}) [OK]")
-                        else:
-                            still_pending.append(item)
-                    pending = still_pending
-                    rem = deadline - time.monotonic()
-                    if not pending or rem <= 0:
+                for base_tag in need_enroll:
+                    gens = slots[base_tag]
+                    next_gen = max(gens.keys()) + 1
+                    new_tag = format_generation_tag(base_tag, next_gen)
+                    try:
+                        self.state.record_registration()
+                        rec = self.registrar.register_masque(license_key=eff_license)
+                    except WarpRateLimitError as e:
+                        logger.error(
+                            f"Core '{cname}': Cloudflare rate limit hit while enrolling '{base_tag}': {e}. Stopping registration batch."
+                        )
                         break
-                    time.sleep(min(3.0, rem))
+                    except WarpRegistrationError as e:
+                        logger.error(f"Core '{cname}': MASQUE registration failed for '{base_tag}': {e}")
+                        continue
 
-                for base_tag, new_tag, ep in pending:
-                    logger.warning(
-                        f"Core '{cname}': staged MASQUE outbound '{new_tag}' ({ep}) did not pass Observatory probe "
-                        f"within {probe_timeout}s; keeping '{base_tag}' on its existing working outbound."
+                    self.device_store.put(cid, base_tag, rec)
+                    port = self.warp._pick_masque_port(rec["endpoint_ip"], used_endpoints)
+                    ep = f"{rec['endpoint_ip']}:{port}"
+                    used_endpoints.add(ep)
+                    new_ob = self.registrar.build_masque_outbound(
+                        new_tag, rec, port=port, alpn=self.config.masque_alpn
+                    )
+                    stage_a_cfg.setdefault("outbounds", []).append(new_ob)
+                    staged.append((base_tag, new_tag, ep))
+                    logger.info(f"Core '{cname}': Enrolled MASQUE device for '{base_tag}' → staged outbound '{new_tag}' ({ep})")
+
+                if staged:
+                    is_safe, unsafe_reason = LiveSafetyValidator.check(
+                        ccfg, stage_a_cfg, live_remove_supported=self.config.live_remove_supported
+                    )
+                    if not is_safe:
+                        logger.error(f"Core '{cname}': Stage A refused (would restart Xray: {unsafe_reason})")
+                        staged = []
+
+                if staged:
+                    payload_a = {
+                        "name": core.get("name"),
+                        "config": stage_a_cfg,
+                        "type": core.get("type"),
+                        "exclude_inbound_tags": list(core.get("exclude_inbound_tags", [])),
+                        "fallbacks_inbound_tags": list(core.get("fallbacks_inbound_tags", [])),
+                    }
+                    self.client.update_core(cid, payload_a, restart_nodes=True)
+                    self.device_store.save()
+                    self.state.save()
+                    logger.info(
+                        f"Core '{cname}': Stage A AddOutbound pushed live for {len(staged)} MASQUE outbound(s) (0 Xray restarts; users untouched)."
                     )
 
-            if not verified:
+                    # Observatory verification loop
+                    if not wait_probe:
+                        newly_verified = list(staged)
+                    else:
+                        deadline = time.monotonic() + max(1, int(probe_timeout))
+                        pending = list(staged)
+                        while pending:
+                            telemetry = self.warp.poll_core_observatory(self.client, cid, nodes, core_config=stage_a_cfg)
+                            still_pending: list[tuple[str, str, str]] = []
+                            for item in pending:
+                                if self.warp.is_tag_confirmed_healthy(telemetry.get(item[1], [])):
+                                    newly_verified.append(item)
+                                    logger.info(f"Core '{cname}': Probe verified MASQUE outbound '{item[1]}' ({item[2]}) [OK]")
+                                else:
+                                    still_pending.append(item)
+                            pending = still_pending
+                            rem = deadline - time.monotonic()
+                            if not pending or rem <= 0:
+                                break
+                            time.sleep(min(3.0, rem))
+
+                        for base_tag, new_tag, ep in pending:
+                            logger.warning(
+                                f"Core '{cname}': staged MASQUE outbound '{new_tag}' ({ep}) did not pass Observatory probe "
+                                f"within {probe_timeout}s; keeping '{base_tag}' on its existing working outbound."
+                            )
+                else:
+                    logger.error(f"Core '{cname}': no new MASQUE outbounds were enrolled; skipping Stage A.")
+
+            all_verified = pre_verified + newly_verified
+            if not all_verified:
                 logger.error(
-                    f"Core '{cname}': zero staged MASQUE outbounds verified healthy; skipping Stage B cutover (users unaffected)."
+                    f"Core '{cname}': zero MASQUE outbounds verified healthy; skipping Stage B cutover (users unaffected)."
                 )
                 continue
 
-            # Stage B: Live ReplaceRouting cutover ONLY for probe-verified slots
+            # Stage B: Live ReplaceRouting cutover ONLY for verified slots
             now = time.time()
-            for base_tag, new_tag, ep in verified:
+            for base_tag, new_tag, ep in all_verified:
                 self.state.set_active_tag(cid, base_tag, new_tag)
                 self.state.identity_created_ts[f"{cid}:{new_tag}"] = now
                 self.state.last_rotation_mode[f"{cid}:{base_tag}"] = "masque"
@@ -3598,7 +3773,7 @@ class RouteSync:
 
             self.sync(core_selector=str(cid), routing_only=True)
             logger.info(
-                f"Core '{cname}': Stage B live ReplaceRouting complete for {len(verified)} MASQUE slot(s) (0 dropped connections)."
+                f"Core '{cname}': Stage B live ReplaceRouting complete for {len(all_verified)} MASQUE slot(s) (0 dropped connections)."
             )
 
         return migrated_slots
@@ -3635,12 +3810,17 @@ class Daemon:
             f"(auto_heal_warp={self.syncer.config.auto_heal_warp})"
         )
         while self._running:
-            if self._reload_requested:
-                self._reload_requested = False
-                self.syncer.config.load()
-
             try:
-                self.syncer.sync()
+                with self.syncer._exclusive_guard():
+                    if self._reload_requested:
+                        self._reload_requested = False
+                        self.syncer.config.load()
+                        self.syncer.state.load()
+                        self.syncer.device_store.load()
+                    self.syncer.sync()
+                    if not self.syncer.dry_run:
+                        self.syncer.state.save()
+                        self.syncer.device_store.save()
             except Exception as e:
                 logger.error(f"Sync cycle failed: {e}")
 
